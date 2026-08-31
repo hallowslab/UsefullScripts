@@ -13,6 +13,8 @@ NFT_CHAIN=''
 NFT_SET=''
 USE_SUDO=0
 ASSUME_YES=0
+declare -a IGNORE_JAILS=()
+declare -a IGNORE_SETS=()
 
 usage() {
     cat <<EOF
@@ -21,10 +23,12 @@ Usage: $PROGRAM --ip ADDRESS [options]
 Checks:
   --ip ADDRESS             IPv4 or IPv6 address to inspect (required)
   --jail NAME              Check only this Fail2ban jail
+  --ignore-jail NAME       Ignore Fail2ban jail (repeatable)
   --family FAMILY          Limit nftables search (inet, ip, ip6, ...)
   --table TABLE            Limit nftables search to table
   --chain CHAIN            Limit nftables search to chain
   --set SET                Limit nftables search to set
+  --ignore-set SET         Ignore nftables set (repeatable)
 
 Actions:
   --unban TARGET           Remove from fail2ban, nft, or both
@@ -78,6 +82,15 @@ contains_ip() {
     [[ $line =~ (^|[[:space:]{,])$needle([[:space:]},;]|$) ]]
 }
 
+is_ignored() {
+    local value=$1 ignored
+    shift
+    for ignored in "$@"; do
+        [[ $value == "$ignored" ]] && return 0
+    done
+    return 1
+}
+
 check_fail2ban() {
     local jail_list jail jail_status banned found=0
 
@@ -99,6 +112,7 @@ check_fail2ban() {
     for jail in "${jail_names[@]}"; do
         jail=${jail//[[:space:]]/}
         [[ -n $jail ]] || continue
+        is_ignored "$jail" "${IGNORE_JAILS[@]}" && continue
         jail_status=$(run_privileged fail2ban-client status "$jail" 2>/dev/null) || {
             printf 'Fail2ban: jail=%s unable to read status\n' "$jail"
             continue
@@ -140,6 +154,7 @@ check_nft() {
         [[ -n $NFT_TABLE && $table != "$NFT_TABLE" ]] && continue
         [[ -n $NFT_CHAIN && $chain != "$NFT_CHAIN" ]] && continue
         [[ -n $NFT_SET && $set != "$NFT_SET" ]] && continue
+        [[ -n $set ]] && is_ignored "$set" "${IGNORE_SETS[@]}" && continue
 
         if contains_ip "$line"; then
             if [[ -n $set ]]; then
@@ -169,6 +184,7 @@ unban_fail2ban() {
     for jail in "${jail_names[@]}"; do
         jail=${jail//[[:space:]]/}
         [[ -n $jail ]] || continue
+        is_ignored "$jail" "${IGNORE_JAILS[@]}" && continue
         printf 'Fail2ban: unbanning jail=%s ip=%s\n' "$jail" "$IP"
         run_privileged fail2ban-client set "$jail" unbanip "$IP" ||
             printf 'Fail2ban: unban failed jail=%s\n' "$jail" >&2
@@ -196,6 +212,7 @@ unban_nft() {
         [[ -n $NFT_TABLE && $table != "$NFT_TABLE" ]] && continue
         [[ -n $NFT_CHAIN && $chain != "$NFT_CHAIN" ]] && continue
         [[ -n $NFT_SET && $set != "$NFT_SET" ]] && continue
+        is_ignored "$set" "${IGNORE_SETS[@]}" && continue
         key="$family|$table|$set"
         [[ -n ${seen[$key]:-} ]] && continue
         seen[$key]=1
@@ -209,10 +226,12 @@ while (($#)); do
     case $1 in
         --ip) [[ $# -ge 2 ]] || die "--ip needs value"; IP=$2; shift 2 ;;
         --jail) [[ $# -ge 2 ]] || die "--jail needs value"; JAIL=$2; shift 2 ;;
+        --ignore-jail) [[ $# -ge 2 ]] || die "--ignore-jail needs value"; IGNORE_JAILS+=("$2"); shift 2 ;;
         --family) [[ $# -ge 2 ]] || die "--family needs value"; NFT_FAMILY=$2; shift 2 ;;
         --table) [[ $# -ge 2 ]] || die "--table needs value"; NFT_TABLE=$2; shift 2 ;;
         --chain) [[ $# -ge 2 ]] || die "--chain needs value"; NFT_CHAIN=$2; shift 2 ;;
         --set) [[ $# -ge 2 ]] || die "--set needs value"; NFT_SET=$2; shift 2 ;;
+        --ignore-set) [[ $# -ge 2 ]] || die "--ignore-set needs value"; IGNORE_SETS+=("$2"); shift 2 ;;
         --unban) [[ $# -ge 2 ]] || die "--unban needs target"; UNBAN=$2; shift 2 ;;
         --sudo) USE_SUDO=1; shift ;;
         --yes) ASSUME_YES=1; shift ;;
