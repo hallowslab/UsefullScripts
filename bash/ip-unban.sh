@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Check whether an IP is banned in Fail2ban and/or nftables. Read-only.
-# To remove bans, use ip-unban.sh.
+# Remove an IP ban from Fail2ban and/or nftables sets.
+# Finds where the IP is actually banned, asks confirmation, removes, re-verifies.
+# To inspect without removing, use ip-ban-check.sh.
 
 set -u
 
@@ -12,29 +13,34 @@ NFT_TABLE=''
 NFT_CHAIN=''
 NFT_SET=''
 USE_SUDO=0
+ASSUME_YES=0
 declare -a IGNORE_JAILS=()
 declare -a IGNORE_SETS=()
+declare -a BAN_JAILS=()
+declare -a BAN_SETS=()
+RULE_MATCH=0
 
 usage() {
     cat <<EOF
 Usage: $PROGRAM --ip ADDRESS [options]
 
-  --ip ADDRESS             IPv4 or IPv6 address to inspect (required)
-  --jail NAME              Check only this Fail2ban jail
-  --ignore-jail NAME       Ignore Fail2ban jail (repeatable)
+  --ip ADDRESS             IPv4 or IPv6 address to unban (required)
+  --jail NAME              Only unban this Fail2ban jail
+  --ignore-jail NAME       Skip Fail2ban jail (repeatable)
   --family FAMILY          Limit nftables search (inet, ip, ip6, ...)
   --table TABLE            Limit nftables search to table
   --chain CHAIN            Limit nftables search to chain
   --set SET                Limit nftables search to set
-  --ignore-set SET         Ignore nftables set (repeatable)
+  --ignore-set SET         Skip nftables set (repeatable)
+  --yes                    Do not ask for confirmation
   --sudo                   Run fail2ban-client and nft through sudo
   -h, --help               Show this help
 
-Exit codes: 0 IP banned somewhere, 1 IP not banned, 2 error.
+Exit codes: 0 IP unbanned (or was not banned), 1 removal failed/partial, 2 error.
 
 Examples:
   $PROGRAM --ip 203.0.113.7
-  $PROGRAM --ip 2001:db8::7 --family inet --table filter --set blacklist
+  $PROGRAM --ip 2001:db8::7 --family inet --table filter --set blacklist --yes
 EOF
 }
 
@@ -86,52 +92,45 @@ is_ignored() {
     return 1
 }
 
-check_fail2ban() {
-    local jail_list jail jail_status banned found=0
+find_fail2ban() {
+    local jail_list jail jail_status banned
 
     need_command fail2ban-client
     jail_list=$(run_privileged fail2ban-client status 2>/dev/null |
         sed -n 's/.*Jail list:[[:space:]]*//p') || {
-        printf 'Fail2ban: unable to read jail list\n'
+        printf 'Fail2ban: unable to read jail list\n' >&2
         return 1
     }
 
     if [[ -n $JAIL ]]; then
         jail_list=$JAIL
     elif [[ -z $jail_list ]]; then
-        printf 'Fail2ban: no jails found\n'
-        return 1
+        return 0
     fi
 
+    BAN_JAILS=()
     IFS=',' read -ra jail_names <<< "$jail_list"
     for jail in "${jail_names[@]}"; do
         jail=${jail//[[:space:]]/}
         [[ -n $jail ]] || continue
         is_ignored "$jail" "${IGNORE_JAILS[@]}" && continue
-        jail_status=$(run_privileged fail2ban-client status "$jail" 2>/dev/null) || {
-            printf 'Fail2ban: jail=%s unable to read status\n' "$jail"
-            continue
-        }
+        jail_status=$(run_privileged fail2ban-client status "$jail" 2>/dev/null) || continue
         banned=$(sed -n 's/.*Banned IP list:[[:space:]]*//p' <<< "$jail_status")
-        if [[ " $banned " == *" $IP "* ]]; then
-            printf 'Fail2ban: jail=%s banned=yes\n' "$jail"
-            found=1
-        else
-            printf 'Fail2ban: jail=%s banned=no\n' "$jail"
-        fi
+        [[ " $banned " == *" $IP "* ]] && BAN_JAILS+=("$jail")
     done
-    (( found ))
 }
 
-check_nft() {
-    local rules line family table chain set found=0
+find_nft() {
+    local rules line family table chain set key
 
     need_command nft
     rules=$(run_privileged nft -a list ruleset 2>/dev/null) || {
-        printf 'nftables: unable to read ruleset\n'
+        printf 'nftables: unable to read ruleset\n' >&2
         return 1
     }
 
+    BAN_SETS=()
+    RULE_MATCH=0
     family=''; table=''; chain=''; set=''
     while IFS= read -r line; do
         if [[ $line =~ ^table[[:space:]]+([^[:space:]]+)[[:space:]]+([^[:space:]]+)[[:space:]]*\{ ]]; then
@@ -150,19 +149,27 @@ check_nft() {
         [[ -n $NFT_SET && $set != "$NFT_SET" ]] && continue
         [[ -n $set ]] && is_ignored "$set" "${IGNORE_SETS[@]}" && continue
 
-        if contains_ip "$line"; then
-            if [[ -n $set ]]; then
-                printf 'nftables: family=%s table=%s chain=%s set=%s banned=yes\n' \
-                    "$family" "$table" "${chain:--}" "$set"
-            else
-                printf 'nftables: family=%s table=%s chain=%s set=- rule-match=yes\n' \
-                    "$family" "$table" "${chain:--}"
-            fi
-            found=1
+        contains_ip "$line" || continue
+        if [[ -n $set ]]; then
+            key="$family|$table|$set"
+            [[ " ${BAN_SETS[*]-} " == *" $key "* ]] || BAN_SETS+=("$key")
+        else
+            RULE_MATCH=1
         fi
     done <<< "$rules"
-    (( found )) || printf 'nftables: IP not found\n'
-    (( found ))
+}
+
+verify_gone() {
+    local left=0
+    find_fail2ban && (( ${#BAN_JAILS[@]} )) && left=1
+    find_nft && { (( ${#BAN_SETS[@]} )) || (( RULE_MATCH )); } && left=1
+    if (( left )); then
+        printf 'WARNING: IP still present after unban:\n' >&2
+        for jail in "${BAN_JAILS[@]+"${BAN_JAILS[@]}"}"; do printf '  fail2ban jail=%s\n' "$jail" >&2; done
+        for key in "${BAN_SETS[@]+"${BAN_SETS[@]}"}"; do printf '  nftables %s\n' "${key//|/ }" >&2; done
+        return 1
+    fi
+    printf 'Verified: %s no longer banned\n' "$IP"
 }
 
 while (($#)); do
@@ -175,7 +182,7 @@ while (($#)); do
         --chain) [[ $# -ge 2 ]] || die "--chain needs value"; NFT_CHAIN=$2; shift 2 ;;
         --set) [[ $# -ge 2 ]] || die "--set needs value"; NFT_SET=$2; shift 2 ;;
         --ignore-set) [[ $# -ge 2 ]] || die "--ignore-set needs value"; IGNORE_SETS+=("$2"); shift 2 ;;
-        --unban) die "--unban moved to ip-unban.sh" ;;
+        --yes) ASSUME_YES=1; shift ;;
         --sudo) USE_SUDO=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1" ;;
@@ -185,8 +192,41 @@ done
 [[ -n $IP ]] || die '--ip is required'
 valid_ip || die "invalid IP address: $IP"
 
-banned=0
-check_fail2ban && banned=1
-check_nft && banned=1
-(( banned )) && exit 0
-exit 1
+find_fail2ban
+find_nft
+
+if (( ${#BAN_JAILS[@]} == 0 && ${#BAN_SETS[@]} == 0 && RULE_MATCH == 0 )); then
+    printf 'Nothing found to unban for %s\n' "$IP"
+    exit 0
+fi
+
+printf 'Bans found for %s:\n' "$IP"
+for jail in "${BAN_JAILS[@]+"${BAN_JAILS[@]}"}"; do printf '  fail2ban: jail=%s\n' "$jail"; done
+for key in "${BAN_SETS[@]+"${BAN_SETS[@]}"}"; do printf '  nftables: set %s\n' "${key//|/ }"; done
+(( RULE_MATCH )) && printf '  nftables: static rule match (NOT auto-removed, delete manually via: nft delete rule ...)\n'
+
+if (( ! ASSUME_YES )); then
+    printf 'Remove these bans? [y/N] '
+    read -r answer || exit 1
+    [[ $answer == [yY] || $answer == [yY][eE][sS] ]] || { printf 'Cancelled\n'; exit 0; }
+fi
+
+rc=0
+for jail in "${BAN_JAILS[@]+"${BAN_JAILS[@]}"}"; do
+    printf 'Fail2ban: unbanning jail=%s ip=%s\n' "$jail" "$IP"
+    run_privileged fail2ban-client set "$jail" unbanip "$IP" || {
+        printf 'Fail2ban: unban failed jail=%s\n' "$jail" >&2
+        rc=1
+    }
+done
+for key in "${BAN_SETS[@]+"${BAN_SETS[@]}"}"; do
+    IFS='|' read -r family table set <<< "$key"
+    printf 'nftables: deleting family=%s table=%s set=%s ip=%s\n' "$family" "$table" "$set" "$IP"
+    run_privileged nft delete element "$family" "$table" "$set" "{" "$IP" "}" || {
+        printf 'nftables: delete failed family=%s table=%s set=%s\n' "$family" "$table" "$set" >&2
+        rc=1
+    }
+done
+
+verify_gone || rc=1
+exit "$rc"
