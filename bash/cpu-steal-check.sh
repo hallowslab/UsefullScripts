@@ -72,10 +72,10 @@ cores=$(grep -c '^processor' /proc/cpuinfo || echo 1)
 
 if [[ $INTERVAL -eq 0 ]]; then
     uptime_secs=$(cut -d. -f1 /proc/uptime)
-    wall_secs=$((uptime_secs * cores))
+    wall_jiffies=$((uptime_secs * cores * HZ))
 
     printf 'Since boot (uptime %s, %s vCPU cores, HZ %s):\n' "$(fmt_secs $((uptime_secs * HZ)))" "$cores" "$HZ"
-    printf '  steal:      %s of CPU time (%s s of core time)\n' "$(fmt_pct "$steal" "$wall_secs")%" "$((steal / HZ))"
+    printf '  steal:      %s of CPU time (%s s of core time)\n' "$(fmt_pct "$steal" "$wall_jiffies")%" "$((steal / HZ))"
     printf '  total CPU:  %s s\n' "$((total / HZ))"
     printf '  busy CPU:   %s\n' "$(fmt_pct $((total - idle - iowait)) "$total")%"
     printf '\nNote: steal %% above is share of all vCPU time (uptime x cores).\n'
@@ -87,7 +87,7 @@ read_cpu
 
 d_steal=$((steal - start_steal))
 d_total=$((total - start_total))
-cap=$((INTERVAL * cores))
+cap=$((INTERVAL * cores * HZ))
 
 printf 'Over last %ss (%s vCPU cores):\n' "$INTERVAL" "$cores"
 printf '  steal:      %s of CPU time\n' "$(fmt_pct "$d_steal" "$cap")%"
