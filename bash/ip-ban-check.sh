@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Check whether an IP is banned in Fail2ban and/or nftables. Read-only.
+# Check whether an IP is banned in Fail2ban and/or nftables, or whether an IP
+# is whitelisted in an nftables set. Read-only.
 # To remove bans, use ip-unban.sh.
 
 set -u
@@ -12,6 +13,7 @@ NFT_TABLE=''
 NFT_CHAIN=''
 NFT_SET=''
 USE_SUDO=0
+ALLOWED=0
 declare -a IGNORE_JAILS=()
 declare -a IGNORE_SETS=()
 
@@ -27,14 +29,19 @@ Usage: $PROGRAM --ip ADDRESS [options]
   --chain CHAIN            Limit nftables search to chain
   --set SET                Limit nftables search to set
   --ignore-set SET         Ignore nftables set (repeatable)
+  --allowed                Check if IP is in a whitelist nftables set instead
+                           of banned state. Requires --set; --family and
+                           --table default to inet and filter.
   --sudo                   Run fail2ban-client and nft through sudo
   -h, --help               Show this help
 
 Exit codes: 0 IP banned somewhere, 1 IP not banned, 2 error.
+            With --allowed: 0 IP in whitelist set, 1 IP not in set, 2 error.
 
 Examples:
   $PROGRAM --ip 203.0.113.7
   $PROGRAM --ip 2001:db8::7 --family inet --table filter --set blacklist
+  $PROGRAM --ip 185.237.102.80 --allowed --set portugal_ipv4
 EOF
 }
 
@@ -165,6 +172,22 @@ check_nft() {
     (( found ))
 }
 
+check_nft_allowed() {
+    local family=${NFT_FAMILY:-inet} table=${NFT_TABLE:-filter} set=$NFT_SET out rc
+
+    [[ -n $set ]] || die '--allowed requires --set'
+    need_command nft
+    out=$(run_privileged nft get element "$family" "$table" "$set" "{ $IP }" 2>&1)
+    rc=$?
+    if (( rc == 0 )); then
+        printf 'nftables: family=%s table=%s set=%s allowed=yes\n' "$family" "$table" "$set"
+        return 0
+    fi
+    printf 'nftables: family=%s table=%s set=%s allowed=no\n' "$family" "$table" "$set"
+    [[ -n $out ]] && printf '  nft: %s\n' "$out" >&2
+    return 1
+}
+
 while (($#)); do
     case $1 in
         --ip) [[ $# -ge 2 ]] || die "--ip needs value"; IP=$2; shift 2 ;;
@@ -175,6 +198,7 @@ while (($#)); do
         --chain) [[ $# -ge 2 ]] || die "--chain needs value"; NFT_CHAIN=$2; shift 2 ;;
         --set) [[ $# -ge 2 ]] || die "--set needs value"; NFT_SET=$2; shift 2 ;;
         --ignore-set) [[ $# -ge 2 ]] || die "--ignore-set needs value"; IGNORE_SETS+=("$2"); shift 2 ;;
+        --allowed) ALLOWED=1; shift ;;
         --unban) die "--unban moved to ip-unban.sh" ;;
         --sudo) USE_SUDO=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -184,6 +208,11 @@ done
 
 [[ -n $IP ]] || die '--ip is required'
 valid_ip || die "invalid IP address: $IP"
+
+if (( ALLOWED )); then
+    check_nft_allowed && exit 0
+    exit 1
+fi
 
 banned=0
 check_fail2ban && banned=1
