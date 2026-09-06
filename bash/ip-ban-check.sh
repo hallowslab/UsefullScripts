@@ -177,6 +177,11 @@ check_nft_allowed() {
 
     [[ -n $set ]] || die '--allowed requires --set'
     need_command nft
+    if ! out=$(run_privileged nft list set "$family" "$table" "$set" 2>&1); then
+        printf 'nftables: family=%s table=%s set=%s not found\n' "$family" "$table" "$set" >&2
+        [[ -n $out ]] && printf '  nft: %s\n' "$out" >&2
+        exit 2
+    fi
     out=$(run_privileged nft get element "$family" "$table" "$set" "{ $IP }" 2>&1)
     rc=$?
     if (( rc == 0 )); then
